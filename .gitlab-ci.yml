@@ -1,0 +1,116 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: always
+
+stages:
+  - static-analysis
+  - update
+  - publish
+
+.python:
+  image: "python:3.9"
+  before_script:
+    - python --version
+    - pip install --requirement requirements.txt
+
+.python_dev:
+  extends: .python
+  before_script:
+    - !reference [.python, before_script]
+    - pip install --requirement requirements-dev.txt
+
+flake8:
+  extends: .python_dev
+  stage: static-analysis
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+  script:
+    - flake8 bin/*
+
+.automatic_update:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "manual"'
+
+.update:
+  extends:
+    - .python
+    - .automatic_update
+  stage: update
+
+update_manga:
+  extends: .update
+  script:
+    - bin/update manga
+  artifacts:
+    paths:
+      - data/manga.jsonl
+      - data/manga-ranking.jsonl
+    expire_in: 3 days
+
+update_anime:
+  extends: .update
+  script:
+    - bin/update anime
+  artifacts:
+    paths:
+      - data/anime.jsonl
+      - data/anime-ranking.jsonl
+    expire_in: 3 days
+
+.install_git:
+  before_script:
+    # install git
+    - apt-get install --yes git
+    # configure git username and email
+    - git config --global user.name "${GITLAB_USER_NAME}"
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+    # configure origin remote url
+    - git remote set-url origin git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}
+
+.install_ssh:
+  before_script:
+    # install openssh-client
+    - apt-get install --yes openssh-client
+    # set up ssh keys
+    # (public key should be added as a deploy key)
+    # (private key should be added as the `SSH_PRIVATE_KEY` CI variable)
+    - eval $(ssh-agent -s)
+    - echo "${SSH_PRIVATE_KEY}" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan "${CI_SERVER_HOST}" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+
+.publish_git:
+  before_script:
+    - apt-get update --yes
+    - !reference [.install_git, before_script]
+    - !reference [.install_ssh, before_script]
+  script:
+    # make sure the commit ref is checked out (not detached HEAD)
+    - git checkout $CI_COMMIT_REF_NAME
+    # commit any updates
+    - |
+      if [[ -n "$(git status --porcelain)" ]]; then
+        git add --all
+        git commit --message "$MESSAGE"
+        git push --push-option ci.skip origin $CI_COMMIT_REF_NAME
+      else
+        echo "Nothing to publish!"
+      fi
+    # tag the current commit
+    - git tag $VERSION
+    - git push --push-option ci.skip origin $VERSION
+
+publish:
+  extends:
+    - .publish_git
+    - .automatic_update
+  stage: publish
+  script:
+    - VERSION=$(date --utc +%Y.%m.%d)
+    - MESSAGE="Update $VERSION"
+    - !reference [.publish_git, script]
